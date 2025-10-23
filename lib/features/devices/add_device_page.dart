@@ -192,6 +192,7 @@ class _AddDevicePageState extends State<AddDevicePage> {
                 : () {
                     setState(() {
                       _wifiList = ['Casa', 'Oficina', 'Invitados', 'ESP32-Test']; // simulación
+                      _selectedWifi = null;
                     });
                     _nextStep();
                   },
