@@ -1,0 +1,382 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 6, 5);
+constexpr int width = 72;
+constexpr int height = 39;
+constexpr int xOffset = 28;
+constexpr int yOffset = 25;
+
+NimBLEServer *pServer = nullptr;
+NimBLECharacteristic *pCharacteristic = nullptr;
+
+Preferences preferences;
+
+bool deviceConnected = false;
+bool bleProvisioningActive = false;
+
+// --- Indicador BLE ---
+constexpr unsigned long BLE_BLINK_INTERVAL = 500;
+
+// --- Botón para activar BLE provisioning ---
+constexpr int BUTTON_PIN = 0;          // GPIO0
+constexpr unsigned long HOLD_TIME = 5000; // 5 segundos
+unsigned long buttonPressedAt = 0;
+bool buttonWasHeld = false;
+
+// --- WiFi ---
+enum class WifiState {
+  NO_CREDENTIALS,
+  CONNECTING,
+  CONNECTED,
+  FAILED
+};
+
+WifiState wifiState = WifiState::NO_CREDENTIALS;
+String wifiSSID = "";
+String wifiPASS = "";
+unsigned long wifiConnectStart = 0;
+constexpr unsigned long WIFI_TIMEOUT = 20000; // 20 segundos
+
+// --- Animaciones ---
+unsigned long lastBlink = 0;
+bool blinkOn = false;
+unsigned long lastWifiAnim = 0;
+uint8_t wifiAnimFrame = 0;
+
+// --- Bitmaps WiFi ---
+static const unsigned char WIFI_BASE_BITMAP[] PROGMEM = {
+  0x00, 0x00,
+  0x07, 0xE0,
+  0x1F, 0xF8,
+  0x38, 0x1C,
+  0x60, 0x06,
+  0x47, 0xE2,
+  0x1F, 0xF8,
+  0x1F, 0xF8,
+  0x07, 0xE0,
+  0x03, 0xC0,
+  0x01, 0x80,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+};
+
+static const unsigned char CHECK_BITMAP[] PROGMEM = {
+  0x00,
+  0x01,
+  0x03,
+  0x86,
+  0xCC,
+  0x78,
+  0x30,
+  0x10,
+};
+
+static const unsigned char CROSS_BITMAP[] PROGMEM = {
+  0x82,
+  0x44,
+  0x28,
+  0x10,
+  0x28,
+  0x44,
+  0x82,
+  0x00,
+};
+
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "87654321-4321-4321-4321-0987654321ba"
+
+void startWifiConnection(const String &ssid, const String &pass) {
+  if (ssid.isEmpty() || pass.isEmpty()) {
+    wifiState = WifiState::NO_CREDENTIALS;
+    return;
+  }
+
+  wifiSSID = ssid;
+  wifiPASS = pass;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+  wifiState = WifiState::CONNECTING;
+  wifiConnectStart = millis();
+  wifiAnimFrame = 0;
+  Serial.printf("📡 Intentando conectar a WiFi: %s\n", wifiSSID.c_str());
+}
+
+void stopProvisioning() {
+  if (!bleProvisioningActive) {
+    return;
+  }
+  bleProvisioningActive = false;
+  blinkOn = false;
+  if (pServer) {
+    pServer->getAdvertising()->stop();
+  }
+  if (pCharacteristic) {
+    pCharacteristic->setValue("Provisioning finalizado");
+    pCharacteristic->notify();
+  }
+  Serial.println("🔕 Provisioning BLE detenido");
+}
+
+void startProvisioning() {
+  if (bleProvisioningActive) {
+    return;
+  }
+  bleProvisioningActive = true;
+  lastBlink = millis();
+  blinkOn = true;
+  if (pServer) {
+    pServer->getAdvertising()->start();
+  }
+  if (pCharacteristic) {
+    pCharacteristic->setValue("Esperando credenciales");
+    pCharacteristic->notify();
+  }
+  Serial.println("🔔 Provisioning BLE activo, esperando credenciales...");
+}
+
+void persistCredentials(const String &ssid, const String &pass) {
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", pass);
+  Serial.println("💾 Credenciales guardadas en NVS");
+}
+
+void drawWifiIcon(int x, int y) {
+  u8g2.drawXBMP(x, y, 16, 16, WIFI_BASE_BITMAP);
+
+  switch (wifiState) {
+    case WifiState::CONNECTING: {
+      static constexpr uint8_t radii[] = {3, 5, 7};
+      const uint8_t frame = wifiAnimFrame % (sizeof(radii) / sizeof(radii[0]));
+      u8g2.drawCircle(x + 8, y + 8, radii[frame]);
+      break;
+    }
+    case WifiState::CONNECTED:
+      u8g2.drawXBMP(x + 11, y + 8, 8, 8, CHECK_BITMAP);
+      break;
+    case WifiState::FAILED:
+    case WifiState::NO_CREDENTIALS:
+      u8g2.drawXBMP(x + 11, y + 8, 8, 8, CROSS_BITMAP);
+      break;
+  }
+}
+
+void updateWifiState() {
+  if (wifiState == WifiState::CONNECTING) {
+    wl_status_t status = WiFi.status();
+    if (status == WL_CONNECTED) {
+      wifiState = WifiState::CONNECTED;
+      Serial.printf("✅ WiFi conectado (%s)\n", WiFi.SSID().c_str());
+      persistCredentials(wifiSSID, wifiPASS);
+      stopProvisioning();
+      if (pCharacteristic) {
+        pCharacteristic->setValue("WiFi conectado");
+        pCharacteristic->notify();
+      }
+    } else if (millis() - wifiConnectStart > WIFI_TIMEOUT) {
+      wifiState = WifiState::FAILED;
+      WiFi.disconnect(true);
+      Serial.println("⛔ Tiempo de espera agotado en conexión WiFi");
+      if (pCharacteristic) {
+        pCharacteristic->setValue("Error de conexión");
+        pCharacteristic->notify();
+      }
+    }
+  } else if (wifiState == WifiState::CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiState = WifiState::FAILED;
+      Serial.println("⚠️ Conexión WiFi perdida");
+      if (pCharacteristic) {
+        pCharacteristic->setValue("WiFi perdido");
+        pCharacteristic->notify();
+      }
+    }
+  }
+}
+
+void updateBleBlink() {
+  if (!bleProvisioningActive) {
+    blinkOn = false;
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (now - lastBlink >= BLE_BLINK_INTERVAL) {
+    lastBlink = now;
+    blinkOn = !blinkOn;
+  }
+}
+
+void drawBleIndicator() {
+  if (!bleProvisioningActive) {
+    return;
+  }
+
+  const int cx = xOffset + width / 2;
+  const int cy = yOffset + height / 2 + 5;
+  const int r = 8;
+
+  if (deviceConnected) {
+    u8g2.drawDisc(cx, cy, r);
+    return;
+  }
+
+  if (blinkOn) {
+    u8g2.drawDisc(cx, cy, r);
+  } else {
+    u8g2.drawCircle(cx, cy, r);
+  }
+}
+
+void handleButton() {
+  const int buttonState = digitalRead(BUTTON_PIN);
+
+  if (buttonState == LOW) {
+    if (buttonPressedAt == 0) {
+      buttonPressedAt = millis();
+    } else if (!buttonWasHeld && millis() - buttonPressedAt >= HOLD_TIME) {
+      buttonWasHeld = true;
+      startProvisioning();
+    }
+  } else {
+    buttonPressedAt = 0;
+    buttonWasHeld = false;
+  }
+}
+
+class CredentialsCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *pChar) {
+    std::string value = pChar->getValue();
+    if (value.empty()) {
+      return;
+    }
+
+    Serial.printf("📥 Datos recibidos por BLE: %s\n", value.c_str());
+    size_t separator = value.find('\n');
+    if (separator == std::string::npos) {
+      separator = value.find('|');
+    }
+
+    if (separator == std::string::npos) {
+      Serial.println("⚠️ Formato inválido. Usa SSID|PASSWORD");
+      return;
+    }
+
+    String ssid = String(value.substr(0, separator).c_str());
+    String pass = String(value.substr(separator + 1).c_str());
+    ssid.trim();
+    pass.trim();
+
+    if (ssid.isEmpty() || pass.isEmpty()) {
+      Serial.println("⚠️ SSID o contraseña vacíos");
+      return;
+    }
+
+    if (pCharacteristic) {
+      pCharacteristic->setValue("Conectando...");
+      pCharacteristic->notify();
+    }
+
+    startWifiConnection(ssid, pass);
+  }
+};
+
+class MyServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("✅ Dispositivo conectado");
+    };
+
+    void onDisconnect(NimBLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("❌ Dispositivo desconectado");
+      if (bleProvisioningActive) {
+        pServer->startAdvertising(); // reanudar advertising
+      }
+    }
+};
+
+void setup() {
+  Serial.begin(9600);
+  delay(3000);
+  Serial.println("Iniciando BLE...");
+  Serial.println("Iniciando...");
+
+  Serial.println("Iniciando OLED...");
+  if (!u8g2.begin()) {
+    Serial.println("❌ Error al iniciar OLED");
+    while (1);
+  }
+  Serial.println("✅ OLED inicializado correctamente.");
+  u8g2.setContrast(255);       // máximo contraste
+  u8g2.setBusClock(400000);    // 400kHz I2C
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  NimBLEDevice::init("ESP32C3_QTPY");
+
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  NimBLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      NIMBLE_PROPERTY::READ |
+                      NIMBLE_PROPERTY::WRITE |
+                      NIMBLE_PROPERTY::NOTIFY
+                    );
+
+  pCharacteristic->setCallbacks(new CredentialsCallbacks());
+  pCharacteristic->setValue("Esperando credenciales");
+  pService->start();
+
+  NimBLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+
+  preferences.begin("wifi", false);
+  String storedSSID = preferences.getString("ssid", "");
+  String storedPASS = preferences.getString("pass", "");
+
+  if (!storedSSID.isEmpty() && !storedPASS.isEmpty()) {
+    Serial.println("📚 Credenciales encontradas, conectando...");
+    startWifiConnection(storedSSID, storedPASS);
+  } else {
+    Serial.println("ℹ️ No hay credenciales guardadas");
+    wifiState = WifiState::NO_CREDENTIALS;
+  }
+}
+
+void loop() {
+  updateWifiState();
+
+  updateBleBlink();
+
+  // --- Animación WiFi ---
+  if (wifiState == WifiState::CONNECTING && (millis() - lastWifiAnim >= 300)) {
+    lastWifiAnim = millis();
+    wifiAnimFrame = (wifiAnimFrame + 1) % 3;
+  }
+
+  handleButton();
+
+  // --- Dibujo: marco + indicadores ---
+  u8g2.clearBuffer();
+  u8g2.drawFrame(xOffset, yOffset, width, height);
+
+  drawWifiIcon(xOffset + 4, yOffset + 4);
+
+  drawBleIndicator();
+
+  u8g2.sendBuffer();
+
+  delay(50);}
