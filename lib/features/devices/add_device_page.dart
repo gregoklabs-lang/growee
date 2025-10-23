@@ -28,11 +28,17 @@ class _AddDevicePageState extends State<AddDevicePage> {
   bool _wifiLoading = false;
   final TextEditingController _passController = TextEditingController();
   bool _connecting = false;
+  bool _waitingProvisioning = false;
+
+  String? _bleStatus;
+  StreamSubscription<String>? _bleStatusSub;
 
   final Logger _logger = Logger();
 
   @override
   void dispose() {
+    _bleStatusSub?.cancel();
+    unawaited(BleService.I.disconnect());
     _passController.dispose();
     super.dispose();
   }
@@ -45,6 +51,9 @@ class _AddDevicePageState extends State<AddDevicePage> {
       _isScanning = true;
       _scanResults.clear();
       _selectedIndex = null;
+      _bleStatus = null;
+      _wifiList = [];
+      _selectedWifi = null;
     });
 
     try {
@@ -145,9 +154,19 @@ class _AddDevicePageState extends State<AddDevicePage> {
       _wifiLoading = true;
       _wifiList = [];
       _selectedWifi = null;
+      _bleStatus = null;
+      _waitingProvisioning = false;
     });
 
     try {
+      final selected = _scanResults[_selectedIndex!];
+      final initialStatus = await BleService.I.ensureConnectedAndReady(selected);
+      _startBleStatusListener();
+      if (!mounted) return;
+      setState(() {
+        _bleStatus = initialStatus;
+      });
+
       final permsOk = await _ensureWifiScanPermissions();
       if (!permsOk) return;
 
@@ -211,16 +230,63 @@ class _AddDevicePageState extends State<AddDevicePage> {
         _nextStep();
       }
     } catch (e, st) {
-      _logger.e('Error durante escaneo Wi-Fi', error: e, stackTrace: st);
+      _logger.e('Error preparando provisión Wi-Fi', error: e, stackTrace: st);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error al escanear redes Wi-Fi: $e')),
+        SnackBar(content: Text('Error al preparar la conexión: $e')),
       );
     } finally {
       if (mounted) {
         setState(() => _wifiLoading = false);
       }
     }
+  }
+
+  void _startBleStatusListener() {
+    _bleStatusSub?.cancel();
+    _bleStatusSub = BleService.I.statusStream.listen((message) {
+      if (!mounted) return;
+
+      final lower = message.toLowerCase();
+      bool success = false;
+      bool error = false;
+      bool finished = false;
+
+      if (_waitingProvisioning) {
+        if (lower.contains('conectado')) {
+          success = true;
+        } else if (lower.contains('error') || lower.contains('perdido')) {
+          error = true;
+        } else if (lower.contains('finalizado')) {
+          finished = true;
+        }
+      }
+
+      setState(() {
+        _bleStatus = message;
+        if (success || error || finished) {
+          _waitingProvisioning = false;
+        }
+      });
+
+      if (success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Dispositivo conectado a Wi-Fi.')),
+        );
+        unawaited(BleService.I.disconnect());
+        if (Navigator.canPop(context)) {
+          Navigator.pop(context);
+        }
+      } else if (error) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      } else if (finished) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      }
+    });
   }
 
   Widget _stepIndicator() {
@@ -381,25 +447,79 @@ class _AddDevicePageState extends State<AddDevicePage> {
             ),
           ),
           const SizedBox(height: 20),
+          if (_bleStatus != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: Colors.blueGrey.shade50,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.blueGrey.shade100),
+              ),
+              child: Text(
+                'Estado ESP32: $_bleStatus',
+                style: const TextStyle(fontSize: 14),
+              ),
+            ),
+          if (_waitingProvisioning)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 12),
+              child: LinearProgressIndicator(minHeight: 4),
+            ),
           ElevatedButton(
-            onPressed: _connecting
+            onPressed: _connecting || _waitingProvisioning
                 ? null
                 : () async {
-                    if (_passController.text.trim().isEmpty) {
+                    final wifi = _selectedWifi;
+                    final password = _passController.text.trim();
+                    if (wifi == null) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                            content:
+                                Text('Selecciona una red Wi-Fi antes de continuar.')),
+                      );
+                      return;
+                    }
+                    if (password.isEmpty) {
                       if (!mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(content: Text('Ingresa la contraseña.')),
                       );
                       return;
                     }
-                    setState(() => _connecting = true);
-                    await Future.delayed(const Duration(seconds: 2));
-                    if (!mounted) return;
-                    setState(() => _connecting = false);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Conexión exitosa.')),
-                    );
-                    Navigator.pop(context);
+
+                    FocusScope.of(context).unfocus();
+                    setState(() {
+                      _connecting = true;
+                      _waitingProvisioning = true;
+                    });
+
+                    try {
+                      await BleService.I.sendWifiCredentials(
+                        ssid: wifi,
+                        password: password,
+                      );
+                      if (!mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                            content: Text(
+                                'Credenciales enviadas. Esperando confirmación del ESP32...')),
+                      );
+                    } catch (e, st) {
+                      _logger.e('Error al enviar credenciales',
+                          error: e, stackTrace: st);
+                      if (!mounted) return;
+                      setState(() => _waitingProvisioning = false);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                            content:
+                                Text('No se pudieron enviar las credenciales: $e')),
+                      );
+                    } finally {
+                      if (!mounted) return;
+                      setState(() => _connecting = false);
+                    }
                   },
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.blueAccent,
@@ -407,8 +527,10 @@ class _AddDevicePageState extends State<AddDevicePage> {
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
             ),
             child: _connecting
-                ? const Text('Conectando...', style: TextStyle(color: Colors.white))
-                : const Text('Conectar', style: TextStyle(color: Colors.white)),
+                ? const Text('Enviando...', style: TextStyle(color: Colors.white))
+                : _waitingProvisioning
+                    ? const Text('Esperando...', style: TextStyle(color: Colors.white))
+                    : const Text('Conectar', style: TextStyle(color: Colors.white)),
           ),
           const SizedBox(height: 12),
           _backButton(),

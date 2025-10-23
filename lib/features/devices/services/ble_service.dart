@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -13,9 +14,94 @@ class BleService {
 
   BluetoothDevice? _connected;
   StreamSubscription<List<ScanResult>>? _scanSub;
+  BluetoothCharacteristic? _provisioningChar;
+  StreamSubscription<List<int>>? _notifySub;
+  final StreamController<String> _statusController =
+      StreamController<String>.broadcast();
+  String? _lastStatusMessage;
+
+  static const String _serviceUuid = '12345678-1234-1234-1234-1234567890ab';
+  static const String _characteristicUuid =
+      '87654321-4321-4321-4321-0987654321ba';
 
   // Exponer el device conectado (solo lectura)
   BluetoothDevice? get connectedDevice => _connected;
+  Stream<String> get statusStream => _statusController.stream;
+  String? get lastStatusMessage => _lastStatusMessage;
+
+  void _emitStatus(List<int> data) {
+    if (_statusController.isClosed) return;
+    if (data.isEmpty) return;
+    final message = utf8.decode(data, allowMalformed: true).trim();
+    if (message.isEmpty) return;
+    _lastStatusMessage = message;
+    _statusController.add(message);
+    _log.i('Estado ESP32: $message');
+  }
+
+  bool _uuidEquals(Guid uuid, String target) => uuid.str.toLowerCase() == target;
+
+  Future<String?> _prepareProvisioningCharacteristic(
+      BluetoothDevice device) async {
+    final services = await device.discoverServices();
+    BluetoothCharacteristic? targetCharacteristic;
+
+    for (final service in services) {
+      if (!_uuidEquals(service.uuid, _serviceUuid)) continue;
+      for (final characteristic in service.characteristics) {
+        if (_uuidEquals(characteristic.uuid, _characteristicUuid)) {
+          targetCharacteristic = characteristic;
+          break;
+        }
+      }
+      if (targetCharacteristic != null) break;
+    }
+
+    if (targetCharacteristic == null) {
+      throw Exception(
+          'El ESP32 no expone la característica de provisión esperada.');
+    }
+
+    _provisioningChar = targetCharacteristic;
+    await targetCharacteristic.setNotifyValue(true);
+
+    await _notifySub?.cancel();
+    _notifySub = targetCharacteristic.value.listen(_emitStatus);
+
+    _lastStatusMessage = null;
+    try {
+      final initialValue = await targetCharacteristic.read();
+      _emitStatus(initialValue);
+    } catch (e) {
+      _log.w('No se pudo leer el valor inicial de la característica: $e');
+    }
+
+    return _lastStatusMessage;
+  }
+
+  Future<String?> ensureConnectedAndReady(ScanResult result,
+      {Duration timeout = const Duration(seconds: 10)}) async {
+    if (_connected != null &&
+        _connected!.remoteId == result.device.remoteId &&
+        _provisioningChar != null) {
+      return _lastStatusMessage;
+    }
+
+    final device = await connect(result, timeout: timeout);
+    return _prepareProvisioningCharacteristic(device);
+  }
+
+  Future<void> sendWifiCredentials(
+      {required String ssid, required String password}) async {
+    final characteristic = _provisioningChar;
+    if (characteristic == null) {
+      throw Exception('No hay un dispositivo BLE listo para provisionar.');
+    }
+
+    final payload = utf8.encode('${ssid.trim()}|${password.trim()}');
+    await characteristic.write(payload, withoutResponse: false);
+    _log.i('Credenciales Wi-Fi enviadas al ESP32');
+  }
 
   /// Pide permisos necesarios. Devuelve true si todo OK.
   Future<bool> ensurePermissions() async {
@@ -169,6 +255,10 @@ class BleService {
         _connected = null;
       }
     }
+    await _notifySub?.cancel();
+    _notifySub = null;
+    _provisioningChar = null;
+    _lastStatusMessage = null;
   }
 
   /// Descubre todos los servicios y características del dispositivo conectado.
