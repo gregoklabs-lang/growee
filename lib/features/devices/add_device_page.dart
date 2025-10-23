@@ -1,7 +1,12 @@
 // lib/features/devices/add_device_page.dart
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:logger/logger.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:wifi_scan/wifi_scan.dart';
 
 import 'services/ble_service.dart'; // 👈 NUEVO: usamos el servicio BLE
 
@@ -20,6 +25,7 @@ class _AddDevicePageState extends State<AddDevicePage> {
 
   List<String> _wifiList = [];
   String? _selectedWifi;
+  bool _wifiLoading = false;
   final TextEditingController _passController = TextEditingController();
   bool _connecting = false;
 
@@ -95,6 +101,127 @@ class _AddDevicePageState extends State<AddDevicePage> {
   void _nextStep() => setState(() => _currentStep++);
   void _previousStep() =>
       _currentStep == 1 ? Navigator.pop(context) : setState(() => _currentStep--);
+
+  Future<bool> _ensureWifiScanPermissions() async {
+    if (!Platform.isAndroid) {
+      if (!mounted) return false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('El escaneo de Wi-Fi solo está disponible en Android.')),
+      );
+      return false;
+    }
+
+    final statuses = await [
+      Permission.locationWhenInUse,
+      Permission.nearbyWifiDevices,
+    ].request();
+
+    if (statuses.values.any((s) => s.isPermanentlyDenied)) {
+      if (!mounted) return false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Otorga permisos de ubicación y Wi-Fi desde la configuración.')),
+      );
+      unawaited(openAppSettings());
+      return false;
+    }
+
+    if (statuses.values.any((s) => !s.isGranted)) {
+      if (!mounted) return false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Se requieren permisos de ubicación y Wi-Fi.')),
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  Future<void> _fetchWifiNetworks() async {
+    if (_wifiLoading) return;
+    if (_selectedIndex == null) return;
+
+    setState(() {
+      _wifiLoading = true;
+      _wifiList = [];
+      _selectedWifi = null;
+    });
+
+    try {
+      final permsOk = await _ensureWifiScanPermissions();
+      if (!permsOk) return;
+
+      final locOn = await BleService.I.ensureLocationServiceOn();
+      if (!locOn) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Activa la ubicación del sistema para escanear Wi-Fi.')),
+        );
+        return;
+      }
+
+      final canScan = await WiFiScan.instance.canStartScan();
+      if (canScan != CanStartScan.yes) {
+        if (!mounted) return;
+        final message = 'No es posible iniciar el escaneo de Wi-Fi (estado: ${canScan.name}).';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+        return;
+      }
+
+      final started = await WiFiScan.instance.startScan();
+      if (!started) {
+        throw Exception('No se pudo iniciar el escaneo de redes Wi-Fi.');
+      }
+
+      await Future.delayed(const Duration(seconds: 2));
+
+      final canGet = await WiFiScan.instance.canGetScannedResults();
+      if (canGet != CanGetScannedResults.yes) {
+        if (!mounted) return;
+        final message =
+            'No es posible obtener las redes Wi-Fi escaneadas (estado: ${canGet.name}).';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+        return;
+      }
+
+      final results = await WiFiScan.instance.getScannedResults();
+      final filtered = results
+          .where((ap) => ap.ssid.trim().isNotEmpty)
+          .toList()
+        ..sort((a, b) => b.level.compareTo(a.level));
+
+      final seen = <String>{};
+      final ssids = <String>[];
+      for (final ap in filtered) {
+        if (seen.add(ap.ssid)) {
+          ssids.add(ap.ssid);
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _wifiList = ssids;
+      });
+
+      if (ssids.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No se detectaron redes Wi-Fi cercanas.')),
+        );
+      } else {
+        _nextStep();
+      }
+    } catch (e, st) {
+      _logger.e('Error durante escaneo Wi-Fi', error: e, stackTrace: st);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al escanear redes Wi-Fi: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _wifiLoading = false);
+      }
+    }
+  }
 
   Widget _stepIndicator() {
     Widget dot(int step) {
@@ -187,21 +314,19 @@ class _AddDevicePageState extends State<AddDevicePage> {
             }),
           const SizedBox(height: 20),
           ElevatedButton(
-            onPressed: _selectedIndex == null
-                ? null
-                : () {
-                    setState(() {
-                      _wifiList = ['Casa', 'Oficina', 'Invitados', 'ESP32-Test']; // simulación
-                      _selectedWifi = null;
-                    });
-                    _nextStep();
-                  },
+            onPressed: _selectedIndex == null || _wifiLoading ? null : _fetchWifiNetworks,
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.blueAccent,
               padding: const EdgeInsets.symmetric(vertical: 14),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
             ),
-            child: const Text('Buscar Wi-Fi', style: TextStyle(color: Colors.white)),
+            child: _wifiLoading
+                ? const SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                  )
+                : const Text('Buscar Wi-Fi', style: TextStyle(color: Colors.white)),
           ),
           const SizedBox(height: 12),
           _backButton(),
