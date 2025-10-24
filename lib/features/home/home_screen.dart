@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../core/routes/app_routes.dart';
 import '../modify/modify_page.dart';
 import '../history/history_page.dart';
 import '../devices/devices_page.dart';
@@ -34,10 +35,28 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: Colors.white,
         elevation: 0.5,
       ),
-      body: const Center(
-        child: Text(
-          'Dashboard Principal',
-          style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Dashboard Principal',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              onPressed: () {
+                Navigator.of(context).pushNamed(AppRoutes.login);
+              },
+              child: const Text('Iniciar sesión'),
+            ),
+          ],
         ),
       ),
     );
