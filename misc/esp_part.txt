@@ -1,8 +1,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiProv.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+#include <algorithm>
+#include <string>
 
 // ===== OLED =====
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 6, 5);
@@ -11,10 +17,11 @@ int height = 39;
 int xOffset = 28;
 int yOffset = 25;
 
-// ===== WiFi Provisioning (BLE sin QR) =====
-static char g_serviceName[20] = "PROV_QTPY_C3";
-static const char *POP        = "abcd1234";     // PIN PoP para Security 1
-static const char *SERVICE_KEY = NULL;
+// ===== WiFi Provisioning (BLE personalizado) =====
+static char g_serviceName[24] = "ESP32-PROV";
+static constexpr char kServiceUuid[] = "12345678-1234-1234-1234-1234567890ab";
+static constexpr char kCharacteristicUuid[] =
+    "87654321-4321-4321-4321-0987654321ba";
 
 const int FORCE_BTN = 0; // GPIO0 / BOOT
 
@@ -26,13 +33,35 @@ enum DispState : uint8_t {
   DISP_CONECTADO
 };
 volatile DispState g_dispState = DISP_DESCONECTADO;
-volatile bool g_showProvisioningInfo = false;
+volatile bool g_showProvisioningInfo = true;
 
 // Animación (puntos y fades)
 uint32_t lastAnimMs = 0;
 volatile uint8_t dots = 0;
 volatile bool pendingFadeToConnected = false;   // Transición B2 → Conectado tras GOT_IP
 const uint16_t fadeMs = 120;           // Duración del fade (ms)
+
+// ===== BLE Provisioning =====
+BLEServer *g_bleServer = nullptr;
+BLECharacteristic *g_provisioningChar = nullptr;
+volatile bool g_centralConnected = false;
+
+String g_lastStatusMessage = "esperando";
+
+static portMUX_TYPE g_credentialsMux = portMUX_INITIALIZER_UNLOCKED;
+String g_pendingSsid;
+String g_pendingPassword;
+volatile bool g_hasPendingCredentials = false;
+
+bool g_wifiConnecting = false;
+bool g_wifiHadIp = false;
+uint32_t g_wifiConnectDeadline = 0;
+volatile bool g_ignoreDisconnectEvent = false;
+
+// ===== Forward declarations =====
+static void notifyStatus(const String &message);
+static void ensureWaitingState();
+static void startWifiConnection(const String &ssid, const String &password);
 
 // ===== Helpers OLED =====
 static void drawFrame() {
@@ -47,12 +76,11 @@ static void drawProvisioningInstructions() {
   u8g2.setCursor(baseX, baseY);
   u8g2.print("Configura con app");
   u8g2.setCursor(baseX, baseY + 9);
-  u8g2.print("Servicio:");
+  u8g2.print("Servicio BLE:");
   u8g2.setCursor(baseX, baseY + 18);
   u8g2.print(g_serviceName);
   u8g2.setCursor(baseX, baseY + 27);
-  u8g2.print("PoP: ");
-  u8g2.print(POP);
+  u8g2.print("UUID fija");
 }
 
 static void drawCenteredText(const char* text) {
@@ -102,8 +130,160 @@ static void oledShow() {
   u8g2.sendBuffer();
 }
 
-// ===== Event Handler WiFi / Provisioning =====
+// ===== BLE helpers =====
+static void updateCharacteristicValue(const String &message, bool notify) {
+  if (!g_provisioningChar) {
+    return;
+  }
+  g_provisioningChar->setValue(message.c_str());
+  if (notify && g_centralConnected) {
+    g_provisioningChar->notify();
+  }
+}
+
+static void notifyStatus(const String &message) {
+  g_lastStatusMessage = message;
+  Serial.printf("[BLE] Estado -> %s\n", message.c_str());
+  updateCharacteristicValue(message, true);
+}
+
+struct WifiCredentials {
+  bool valid = false;
+  String ssid;
+  String password;
+  String errorMessage;
+};
+
+static bool isWhitespace(char c) {
+  return c == '\r' || c == '\n' || c == '\t' || c == ' ';
+}
+
+static void trim(std::string &value) {
+  while (!value.empty() && isWhitespace(value.front())) {
+    value.erase(value.begin());
+  }
+  while (!value.empty() && isWhitespace(value.back())) {
+    value.pop_back();
+  }
+}
+
+static WifiCredentials parseCredentials(const std::string &rawPayload) {
+  WifiCredentials result;
+  if (rawPayload.empty()) {
+    result.errorMessage = "error: vacio";
+    return result;
+  }
+
+  std::string payload = rawPayload;
+  payload.erase(std::remove(payload.begin(), payload.end(), '\r'), payload.end());
+
+  size_t separator = payload.find('\n');
+  if (separator == std::string::npos) {
+    separator = payload.find('|');
+  }
+
+  if (separator == std::string::npos) {
+    result.errorMessage = "error: formato";
+    return result;
+  }
+
+  std::string ssid(payload.begin(), payload.begin() + separator);
+  std::string password(payload.begin() + separator + 1, payload.end());
+
+  trim(ssid);
+  trim(password);
+
+  if (ssid.empty()) {
+    result.errorMessage = "error: ssid";
+    return result;
+  }
+
+  result.valid = true;
+  result.ssid = String(ssid.c_str());
+  result.password = String(password.c_str());
+  return result;
+}
+
+static void enqueueCredentials(const String &ssid, const String &password) {
+  portENTER_CRITICAL(&g_credentialsMux);
+  g_pendingSsid = ssid;
+  g_pendingPassword = password;
+  g_hasPendingCredentials = true;
+  portEXIT_CRITICAL(&g_credentialsMux);
+}
+
+class ProvisioningCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *characteristic) override {
+    const std::string value = characteristic->getValue();
+    WifiCredentials credentials = parseCredentials(value);
+
+    if (!credentials.valid) {
+      notifyStatus(credentials.errorMessage);
+      return;
+    }
+
+    Serial.printf("[BLE] Credenciales recibidas: SSID=%s\n",
+                  credentials.ssid.c_str());
+    enqueueCredentials(credentials.ssid, credentials.password);
+  }
+};
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) override {
+    g_centralConnected = true;
+    Serial.println("[BLE] Central conectada");
+    updateCharacteristicValue(g_lastStatusMessage, true);
+  }
+
+  void onDisconnect(BLEServer *server) override {
+    g_centralConnected = false;
+    Serial.println("[BLE] Central desconectada");
+    BLEDevice::startAdvertising();
+  }
+};
+
+static void buildServiceName() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(g_serviceName, sizeof(g_serviceName), "ESP32-PROV-%02X%02X%02X",
+           mac[3], mac[4], mac[5]);
+}
+
+static void setupBle() {
+  BLEDevice::init(g_serviceName);
+  g_bleServer = BLEDevice::createServer();
+  g_bleServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *service = g_bleServer->createService(kServiceUuid);
+  g_provisioningChar = service->createCharacteristic(
+      kCharacteristicUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+          BLECharacteristic::PROPERTY_NOTIFY);
+  g_provisioningChar->addDescriptor(new BLE2902());
+  g_provisioningChar->setCallbacks(new ProvisioningCallbacks());
+
+  updateCharacteristicValue(g_lastStatusMessage, false);
+
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(kServiceUuid);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
+
+  BLEDevice::startAdvertising();
+  Serial.printf("[BLE] Publicando nombre %s\n", g_serviceName);
+}
+
+// ===== WiFi =====
 void SysProvEvent(arduino_event_t *sys_event) {
+  if (sys_event->event_id == ARDUINO_EVENT_WIFI_STA_DISCONNECTED &&
+      g_ignoreDisconnectEvent) {
+    g_ignoreDisconnectEvent = false;
+    return;
+  }
+
   switch (sys_event->event_id) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       Serial.println("[WIFI] STA_CONNECTED");
@@ -114,128 +294,93 @@ void SysProvEvent(arduino_event_t *sys_event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       Serial.print("[WIFI] GOT_IP: ");
       Serial.println(IPAddress(sys_event->event_info.got_ip.ip_info.ip.addr));
-      // B2: no cambiar en el mismo instante; aplicamos fade en el siguiente tick
       pendingFadeToConnected = true;
+      g_wifiConnecting = false;
+      g_wifiHadIp = true;
+      notifyStatus("conectado");
+      notifyStatus("finalizado");
       break;
 
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serial.printf("[WIFI] DISCONNECTED reason=%d\n",
-                    sys_event->event_info.wifi_sta_disconnected.reason);
-      // SIN reconexiones automáticas: queda desconectado
-      g_dispState = DISP_DESCONECTADO;
-      g_showProvisioningInfo = false;
-      oledShow();
-      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      const int reason = sys_event->event_info.wifi_sta_disconnected.reason;
+      Serial.printf("[WIFI] DISCONNECTED reason=%d\n", reason);
 
-    case ARDUINO_EVENT_PROV_START:
-      Serial.println("[PROV] Provisioning iniciado (BLE)");
+      if (g_wifiHadIp) {
+        notifyStatus("perdido");
+      } else if (g_wifiConnecting) {
+        notifyStatus("error: desconectado");
+      }
+
+      g_wifiConnecting = false;
+      g_wifiHadIp = false;
+      pendingFadeToConnected = false;
       g_dispState = DISP_SETUP;
-      dots = 0;
       g_showProvisioningInfo = true;
-      oledShow();
-      break;
-
-    case ARDUINO_EVENT_PROV_CRED_RECV:
-      Serial.printf("[PROV] Credenciales recibidas: SSID=%s, PASS=%s\n",
-                    sys_event->event_info.prov_cred_recv.ssid,
-                    sys_event->event_info.prov_cred_recv.password);
-      // Encendemos Wi-Fi recién aquí (durante provisioning estuvo OFF)
-      WiFi.mode(WIFI_MODE_STA);
-      g_dispState = DISP_CONECTANDO;
       dots = 0;
-      g_showProvisioningInfo = false;
       oledShow();
       break;
+    }
 
-    case ARDUINO_EVENT_PROV_CRED_FAIL:
-      Serial.printf("[PROV] Credenciales FALLARON (reason=%d)\n",
-                    sys_event->event_info.prov_fail_reason);
-      g_dispState = DISP_SETUP;
-      dots = 0;
-      g_showProvisioningInfo = true;
-      oledShow();
-      break;
-
-    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
-      Serial.println("[PROV] Credenciales OK, conectando...");
-      g_dispState = DISP_CONECTANDO;
-      dots = 0;
-      g_showProvisioningInfo = false;
-      oledShow();
-      break;
-
-    case ARDUINO_EVENT_PROV_END:
-      Serial.println("[PROV] Provisioning finalizado");
+    default:
       break;
   }
 }
 
-// ===== Iniciar BLE Provisioning con app (Security 1) =====
-static void startBleProvisioning() {
-  Serial.println("\n=== BLE Provisioning Security 1 (sin QR) ===");
+static void startWifiConnection(const String &ssid, const String &password) {
+  Serial.printf("[WIFI] Intentando conectar a SSID=%s\n", ssid.c_str());
+  g_ignoreDisconnectEvent = true;
+  WiFi.disconnect(true, true);
+  delay(120);
+  g_ignoreDisconnectEvent = false;
 
-  // Limpiar estados visuales y de transición
-  pendingFadeToConnected = false;
+  WiFi.mode(WIFI_STA);
+  g_wifiConnecting = true;
+  g_wifiHadIp = false;
+  g_wifiConnectDeadline = millis() + 20000;  // 20 segundos
+
+  g_dispState = DISP_CONECTANDO;
+  g_showProvisioningInfo = false;
   dots = 0;
-  g_showProvisioningInfo = true;
-
-  // Importante: WiFi se mantiene OFF (WIFI_MODE_NULL) durante todo el provisioning
-  // El handler WiFi.onEvent(...) está registrado SOLO en setup()
-
-  WiFiProv.beginProvision(
-      WIFI_PROV_SCHEME_BLE,
-      WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
-      WIFI_PROV_SECURITY_1,
-      POP,
-      g_serviceName,
-      SERVICE_KEY);
-
-  Serial.println("Usa tu app para conectarte vía BLE:");
-  Serial.printf("  Servicio: %s\n", g_serviceName);
-  Serial.printf("  PoP: %s\n", POP);
-
-  // Fade al entrar a Setup (tu elección)
-  fadeTextAreaOnly(fadeMs);
-  g_dispState = DISP_SETUP;
-  oledShow();
-}
-
-static void buildServiceName() {
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  snprintf(g_serviceName, sizeof(g_serviceName), "PROV_%02X%02X%02X", mac[3], mac[4], mac[5]);
-}
-
-void setup() {
-  Serial.begin(9600);
-  delay(200);
-
-  buildServiceName();
-  Serial.printf("Servicio BLE asignado: %s\n", g_serviceName);
-  Serial.printf("PoP configurado: %s\n", POP);
-
-  // OLED
-  u8g2.begin();
-  u8g2.setContrast(255);
-  u8g2.setBusClock(400000);
-
-  pinMode(FORCE_BTN, INPUT_PULLUP);
-
-  // Registrar eventos SOLO una vez
-  WiFi.onEvent(SysProvEvent);
-
-  Serial.println("Arrancando... BOOT 5s = Borrar WiFi + WiFi OFF + Provisioning");
-
-  // Estado inicial
-  g_dispState = DISP_DESCONECTADO;
   oledShow();
 
-  // Intento ÚNICO de conexión si hay credenciales guardadas
-  WiFi.mode(WIFI_MODE_STA);
+  notifyStatus("conectando");
+
+  WiFi.begin(ssid.c_str(), password.c_str());
+}
+
+static void processPendingCredentials() {
+  if (!g_hasPendingCredentials) {
+    return;
+  }
+
+  String ssid;
+  String password;
+  portENTER_CRITICAL(&g_credentialsMux);
+  ssid = g_pendingSsid;
+  password = g_pendingPassword;
+  g_hasPendingCredentials = false;
+  portEXIT_CRITICAL(&g_credentialsMux);
+
+  startWifiConnection(ssid, password);
+}
+
+static void ensureWaitingState() {
+  if (g_dispState != DISP_SETUP || !g_showProvisioningInfo) {
+    g_dispState = DISP_SETUP;
+    g_showProvisioningInfo = true;
+    dots = 0;
+    oledShow();
+  }
+  notifyStatus("esperando");
+}
+
+static void attemptStoredConnection() {
+  WiFi.mode(WIFI_STA);
   WiFi.begin();
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 5000) {
     g_dispState = DISP_CONECTANDO;
+    g_showProvisioningInfo = false;
     if (millis() - lastAnimMs > 350) {
       lastAnimMs = millis();
       dots++;
@@ -247,14 +392,45 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Conectado a: "); Serial.println(WiFi.SSID());
     Serial.print("IP: "); Serial.println(WiFi.localIP());
-    // B2: aplicaremos fade en el próximo tick para mostrar “Conectado”
     pendingFadeToConnected = true;
-    lastAnimMs = 0;
+    g_wifiHadIp = true;
+    notifyStatus("conectado");
+    notifyStatus("finalizado");
   } else {
-    Serial.println("Sin WiFi o no conectó al arrancar.");
+    Serial.println("Sin WiFi guardado o no conectó al arrancar.");
     g_dispState = DISP_DESCONECTADO;
+    g_showProvisioningInfo = true;
     oledShow();
+    ensureWaitingState();
   }
+}
+
+void setup() {
+  Serial.begin(9600);
+  delay(200);
+
+  buildServiceName();
+  Serial.printf("Servicio BLE asignado: %s\n", g_serviceName);
+
+  // OLED
+  u8g2.begin();
+  u8g2.setContrast(255);
+  u8g2.setBusClock(400000);
+
+  pinMode(FORCE_BTN, INPUT_PULLUP);
+
+  setupBle();
+
+  WiFi.onEvent(SysProvEvent);
+
+  Serial.println("Arrancando... BOOT 5s = Borrar WiFi + Provisioning BLE");
+
+  // Estado inicial
+  g_dispState = DISP_SETUP;
+  g_showProvisioningInfo = true;
+  oledShow();
+
+  attemptStoredConnection();
 }
 
 void loop() {
@@ -271,21 +447,33 @@ void loop() {
   // No hacemos nada cuando suelta; acción es inmediata a los 5s
   if (pressed && (millis() - pressStart > 5000)) {
     pressed = false;
-    Serial.println("BOOT 5s → Borrar WiFi + WiFi OFF + Provisioning");
+    Serial.println("BOOT 5s → Borrar WiFi y esperar nuevas credenciales");
 
-    // 1) Borrar SIEMPRE credenciales
+    g_ignoreDisconnectEvent = true;
     WiFi.disconnect(true, true);
-
-    // 2) APAGAR completamente WiFi para evitar eventos residuales
-    WiFi.mode(WIFI_MODE_NULL);
     delay(150);
+    g_ignoreDisconnectEvent = false;
 
-    // 3) Reset de estados de UI/transición
     pendingFadeToConnected = false;
     dots = 0;
+    g_wifiConnecting = false;
+    g_wifiHadIp = false;
+    ensureWaitingState();
+  }
 
-    // 4) Entrar a provisioning limpio (BLE + app)
-    startBleProvisioning();
+  processPendingCredentials();
+
+  if (g_wifiConnecting && millis() > g_wifiConnectDeadline) {
+    Serial.println("[WIFI] Timeout al conectar, abortando");
+    g_wifiConnecting = false;
+    g_ignoreDisconnectEvent = true;
+    WiFi.disconnect(true, true);
+    delay(100);
+    g_ignoreDisconnectEvent = false;
+    g_wifiHadIp = false;
+    pendingFadeToConnected = false;
+    notifyStatus("error: timeout");
+    ensureWaitingState();
   }
 
   // === Animación de texto y transición B2 con fade ===
@@ -301,8 +489,16 @@ void loop() {
         pendingFadeToConnected = false;
         fadeTextAreaOnly(fadeMs);
         g_dispState = DISP_CONECTADO;
+        g_showProvisioningInfo = false;
         dots = 0;
+        oledShow();
+      } else {
+        oledShow();
       }
+    }
+  } else if (g_dispState == DISP_SETUP && g_showProvisioningInfo) {
+    if (millis() - lastAnimMs > 1000) {
+      lastAnimMs = millis();
       oledShow();
     }
   }
