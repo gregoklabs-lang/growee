@@ -1,4 +1,3 @@
-// lib/features/devices/add_device_page.dart
 import 'dart:async';
 import 'dart:io';
 
@@ -269,6 +268,12 @@ class _AddDevicePageState extends State<AddDevicePage> {
         }
       });
 
+      String snackBarMessage = message;
+      if (finished && lower.contains('finalizado')) {
+        snackBarMessage =
+            '$message. Mantén presionado el botón 5 segundos para reactivar el modo BLE.';
+      }
+
       if (success) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Dispositivo conectado a Wi-Fi.')),
@@ -279,11 +284,11 @@ class _AddDevicePageState extends State<AddDevicePage> {
         }
       } else if (error) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message)),
+          SnackBar(content: Text(snackBarMessage)),
         );
       } else if (finished) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message)),
+          SnackBar(content: Text(snackBarMessage)),
         );
       }
     });
