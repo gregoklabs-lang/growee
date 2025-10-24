@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:wifi_scan/wifi_scan.dart';
 
 import 'services/ble_service.dart'; // 👈 NUEVO: usamos el servicio BLE
+import 'services/device_registry.dart';
 
 class AddDevicePage extends StatefulWidget {
   const AddDevicePage({super.key});
@@ -275,6 +276,22 @@ class _AddDevicePageState extends State<AddDevicePage> {
       }
 
       if (success) {
+        final selected =
+            _selectedIndex != null && _selectedIndex! < _scanResults.length
+                ? _scanResults[_selectedIndex!]
+                : null;
+        if (selected != null) {
+          final deviceName = selected.device.platformName.isNotEmpty
+              ? selected.device.platformName
+              : (selected.advertisementData.advName.isNotEmpty
+                  ? selected.advertisementData.advName
+                  : 'ESP32');
+          DeviceRegistry.I.addOrUpdate(DeviceInfo(
+            name: deviceName,
+            remoteId: selected.device.remoteId.str,
+          ));
+        }
+
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Dispositivo conectado a Wi-Fi.')),
         );
