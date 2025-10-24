@@ -193,7 +193,13 @@ class BleService {
           'La característica de provisión no permite escrituras desde la app.');
     }
 
-    final payload = utf8.encode('${ssid.trim()}|${password.trim()}');
+    final sanitizedSsid = ssid.trim();
+    final sanitizedPass = password.trim();
+
+    // El firmware del ESP32 acepta SSID y contraseña separados por un salto de línea
+    // (y mantiene compatibilidad con el separador "|"). Preferimos enviar el
+    // formato nuevo para evitar problemas si la contraseña contiene dicho carácter.
+    final payload = utf8.encode('$sanitizedSsid\n$sanitizedPass\n');
     FlutterBluePlusException? lastError;
     for (var attempt = 0; attempt < 2; attempt++) {
       characteristic = _requireProvisioningCharacteristic();
