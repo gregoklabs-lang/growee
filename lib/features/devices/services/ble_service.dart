@@ -193,10 +193,10 @@ class BleService {
           'La característica de provisión no permite escrituras desde la app.');
     }
 
-    String _normalize(String value) => value.replaceAll('\n', '').trim();
+    String normalize(String value) => value.replaceAll('\n', '').trim();
 
-    final normalizedSsid = _normalize(ssid);
-    final normalizedPass = _normalize(password);
+    final normalizedSsid = normalize(ssid);
+    final normalizedPass = normalize(password);
 
     // El firmware actualizado acepta "SSID\nPASS". Mantener un payload alternativo con
     // el antiguo separador "|" nos permite retrocompatibilidad si el usuario no ha
