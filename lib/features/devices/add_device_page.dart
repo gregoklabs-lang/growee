@@ -539,8 +539,9 @@ class _AddDevicePageState extends State<AddDevicePage> {
                                 Text('No se pudieron enviar las credenciales: $e')),
                       );
                     } finally {
-                      if (!mounted) return;
-                      setState(() => _connecting = false);
+                      if (mounted) {
+                        setState(() => _connecting = false);
+                      }
                     }
                   },
             style: ElevatedButton.styleFrom(

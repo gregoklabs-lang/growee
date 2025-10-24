@@ -3,7 +3,7 @@ import 'dart:collection';
 import 'package:flutter/foundation.dart';
 
 class DeviceInfo {
-  const DeviceInfo({
+  DeviceInfo({
     required this.name,
     required this.remoteId,
     DateTime? addedAt,

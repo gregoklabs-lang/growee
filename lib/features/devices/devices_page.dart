@@ -45,7 +45,8 @@ class DevicesPage extends StatelessWidget {
                     final device = devices[index];
                     return ListTile(
                       leading: CircleAvatar(
-                        backgroundColor: Colors.blueAccent.withOpacity(0.1),
+                        backgroundColor:
+                            Colors.blueAccent.withValues(alpha: 0.1),
                         child: const Icon(Icons.developer_board, color: Colors.blueAccent),
                       ),
                       title: Text(device.name.isEmpty ? 'Dispositivo ESP32' : device.name),
