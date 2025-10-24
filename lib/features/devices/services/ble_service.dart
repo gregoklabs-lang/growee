@@ -91,16 +91,146 @@ class BleService {
     return _prepareProvisioningCharacteristic(device);
   }
 
+  Future<void> _clearProvisioningCache() async {
+    await _notifySub?.cancel();
+    _notifySub = null;
+    _provisioningChar = null;
+    _lastStatusMessage = null;
+  }
+
+  Future<void> _reconnectAndPrepare(BluetoothDevice device,
+      {Duration timeout = const Duration(seconds: 10)}) async {
+    _log.w(
+        'Reconectando con ${device.remoteId.str} para recuperar la característica de provisión...');
+
+    await _clearProvisioningCache();
+
+    try {
+      await device.disconnect();
+    } catch (e) {
+      _log.d('Ignorando error al forzar desconexión previa: $e');
+    }
+
+    try {
+      await _waitForConnectionState(
+        device,
+        BluetoothConnectionState.disconnected,
+        timeout: const Duration(seconds: 5),
+      );
+    } catch (_) {}
+
+    try {
+      await device.connect(
+        timeout: timeout,
+        autoConnect: false,
+      );
+
+      await _waitForConnectionState(
+        device,
+        BluetoothConnectionState.connected,
+        timeout: timeout,
+      );
+    } on TimeoutException catch (_) {
+      throw Exception(
+          'Timeout esperando reconexión con el dispositivo BLE ${device.remoteId.str}.');
+    } on FlutterBluePlusException catch (e) {
+      throw Exception(
+          'Error al reconectar con el dispositivo BLE ${device.remoteId.str}: ${e.toString()}');
+    }
+
+    try {
+      await device.requestMtu(247);
+    } catch (_) {}
+
+    await _prepareProvisioningCharacteristic(device);
+    if (_provisioningChar == null) {
+      throw Exception(
+          'No se pudo preparar la característica de provisión tras reconectar.');
+    }
+  }
+
   Future<void> sendWifiCredentials(
       {required String ssid, required String password}) async {
-    final characteristic = _provisioningChar;
-    if (characteristic == null) {
+    final device = _connected;
+    if (device == null) {
       throw Exception('No hay un dispositivo BLE listo para provisionar.');
     }
 
+    if (_provisioningChar == null) {
+      await _prepareProvisioningCharacteristic(device);
+    }
+
+    BluetoothCharacteristic? characteristic = _provisioningChar;
+    if (characteristic == null) {
+      throw Exception(
+          'No se encontró la característica de provisión en el dispositivo BLE.');
+    }
+
+    // Verificar estado de conexión y reintentar si se perdió.
+    final currentState = await device.connectionState.first;
+    if (currentState != BluetoothConnectionState.connected) {
+      try {
+        await _reconnectAndPrepare(device);
+        characteristic = _provisioningChar;
+      } on TimeoutException catch (_) {
+        throw Exception(
+            'No se pudo reconectar con el dispositivo BLE (timeout).');
+      } catch (e) {
+        throw Exception('Fallo al reconectar con el dispositivo BLE: $e');
+      }
+    }
+
+    final supportsWrite = characteristic.properties.write ||
+        characteristic.properties.writeWithoutResponse;
+    if (!supportsWrite) {
+      throw Exception(
+          'La característica de provisión no permite escrituras desde la app.');
+    }
+
+    final useWithoutResponse =
+        !characteristic.properties.write &&
+            characteristic.properties.writeWithoutResponse;
+
     final payload = utf8.encode('${ssid.trim()}|${password.trim()}');
-    await characteristic.write(payload, withoutResponse: false);
-    _log.i('Credenciales Wi-Fi enviadas al ESP32');
+    FlutterBluePlusException? lastError;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      characteristic = _provisioningChar;
+      if (characteristic == null) {
+        throw Exception(
+            'No se pudo acceder a la característica de provisión del ESP32.');
+      }
+
+      try {
+        await characteristic.write(payload, withoutResponse: useWithoutResponse);
+        _log.i('Credenciales Wi-Fi enviadas al ESP32 (intento ${attempt + 1})');
+        return;
+      } on FlutterBluePlusException catch (e) {
+        lastError = e;
+        final errorText = e.toString().toUpperCase();
+        final isGatt133 =
+            errorText.contains('ANDROID-CODE: 133') || errorText.contains('GATT_ERROR');
+
+        if (!isGatt133 || attempt == 1) {
+          _log.e('Error al enviar credenciales al ESP32', error: e);
+          throw Exception(
+              'El dispositivo BLE rechazó las credenciales (${e.toString()}).');
+        }
+
+        _log.w(
+            'Fallo GATT 133 al enviar credenciales. Reintentando tras reconectar...');
+        try {
+          await _reconnectAndPrepare(device);
+        } catch (reconnectError) {
+          throw Exception(
+              'No se pudo recuperar la conexión BLE tras un error GATT: $reconnectError');
+        }
+      }
+    }
+
+    if (lastError != null) {
+      throw Exception(
+          'El dispositivo BLE rechazó las credenciales (${lastError.toString()}).');
+    }
   }
 
   /// Pide permisos necesarios. Devuelve true si todo OK.
@@ -212,7 +342,8 @@ class BleService {
 
   /// Conexión directa al dispositivo de un ScanResult.
   /// No usa autoConnect para que la conexión sea inmediata.
-  Future<BluetoothDevice> connect(ScanResult r, {Duration timeout = const Duration(seconds: 10)}) async {
+  Future<BluetoothDevice> connect(ScanResult r,
+      {Duration timeout = const Duration(seconds: 10)}) async {
     // Desconectar el anterior si existe
     if (_connected != null) {
       try {
@@ -221,12 +352,9 @@ class BleService {
       _connected = null;
     }
 
-    final device = r.device;
+    await _clearProvisioningCache();
 
-    // Opcional: establecer MTU más alto (Android). Ignorado en iOS.
-    try {
-      await device.requestMtu(247);
-    } catch (_) {}
+    final device = r.device;
 
     // Conexión
     await device.connect(
@@ -235,10 +363,18 @@ class BleService {
     );
 
     // Confirmar estado conectado
-    final cs = await device.connectionState.first;
-    if (cs != BluetoothConnectionState.connected) {
-      throw Exception('No se pudo conectar (estado: $cs)');
+    try {
+      await _waitForConnectionState(device, BluetoothConnectionState.connected,
+          timeout: timeout);
+    } on TimeoutException catch (_) {
+      throw Exception(
+          'No se pudo conectar (timeout esperando estado conectado)');
     }
+
+    // Opcional: establecer MTU más alto (Android). Ignorado en iOS.
+    try {
+      await device.requestMtu(247);
+    } catch (_) {}
 
     _connected = device;
     _log.i('Conectado a ${device.remoteId.str} (${device.platformName})');
@@ -255,10 +391,7 @@ class BleService {
         _connected = null;
       }
     }
-    await _notifySub?.cancel();
-    _notifySub = null;
-    _provisioningChar = null;
-    _lastStatusMessage = null;
+    await _clearProvisioningCache();
   }
 
   /// Descubre todos los servicios y características del dispositivo conectado.
@@ -283,5 +416,16 @@ class BleService {
     await _scanSub?.cancel();
     _scanSub = null;
     // no desconectamos aquí intencionalmente
+  }
+
+  Future<BluetoothConnectionState> _waitForConnectionState(
+    BluetoothDevice device,
+    BluetoothConnectionState desired, {
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    return device.connectionState
+        .where((state) => state == desired)
+        .first
+        .timeout(timeout);
   }
 }
