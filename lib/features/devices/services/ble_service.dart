@@ -66,7 +66,7 @@ class BleService {
     await targetCharacteristic.setNotifyValue(true);
 
     await _notifySub?.cancel();
-    _notifySub = targetCharacteristic.value.listen(_emitStatus);
+    _notifySub = targetCharacteristic.lastValueStream.listen(_emitStatus);
 
     _lastStatusMessage = null;
     try {
@@ -96,6 +96,15 @@ class BleService {
     _notifySub = null;
     _provisioningChar = null;
     _lastStatusMessage = null;
+  }
+
+  BluetoothCharacteristic _requireProvisioningCharacteristic() {
+    final characteristic = _provisioningChar;
+    if (characteristic == null) {
+      throw Exception(
+          'No se encontró la característica de provisión en el dispositivo BLE.');
+    }
+    return characteristic;
   }
 
   Future<void> _reconnectAndPrepare(BluetoothDevice device,
@@ -160,18 +169,15 @@ class BleService {
       await _prepareProvisioningCharacteristic(device);
     }
 
-    BluetoothCharacteristic? characteristic = _provisioningChar;
-    if (characteristic == null) {
-      throw Exception(
-          'No se encontró la característica de provisión en el dispositivo BLE.');
-    }
+    BluetoothCharacteristic characteristic =
+        _requireProvisioningCharacteristic();
 
     // Verificar estado de conexión y reintentar si se perdió.
     final currentState = await device.connectionState.first;
     if (currentState != BluetoothConnectionState.connected) {
       try {
         await _reconnectAndPrepare(device);
-        characteristic = _provisioningChar;
+        characteristic = _requireProvisioningCharacteristic();
       } on TimeoutException catch (_) {
         throw Exception(
             'No se pudo reconectar con el dispositivo BLE (timeout).');
@@ -187,18 +193,13 @@ class BleService {
           'La característica de provisión no permite escrituras desde la app.');
     }
 
-    final useWithoutResponse =
-        !characteristic.properties.write &&
-            characteristic.properties.writeWithoutResponse;
-
     final payload = utf8.encode('${ssid.trim()}|${password.trim()}');
     FlutterBluePlusException? lastError;
     for (var attempt = 0; attempt < 2; attempt++) {
-      characteristic = _provisioningChar;
-      if (characteristic == null) {
-        throw Exception(
-            'No se pudo acceder a la característica de provisión del ESP32.');
-      }
+      characteristic = _requireProvisioningCharacteristic();
+
+      final useWithoutResponse = !characteristic.properties.write &&
+          characteristic.properties.writeWithoutResponse;
 
       try {
         await characteristic.write(payload, withoutResponse: useWithoutResponse);
