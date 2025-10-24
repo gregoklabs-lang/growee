@@ -11,10 +11,10 @@ int height = 39;
 int xOffset = 28;
 int yOffset = 25;
 
-// ===== WiFi Provisioning (BLE con QR) =====
-static const char *SERVICE_NAME = "PROV_QTPY_C3";
-static const char *POP          = "abcd1234";     // PIN PoP para Security 1
-static const char *SERVICE_KEY  = NULL;
+// ===== WiFi Provisioning (BLE sin QR) =====
+static char g_serviceName[20] = "PROV_QTPY_C3";
+static const char *POP        = "abcd1234";     // PIN PoP para Security 1
+static const char *SERVICE_KEY = NULL;
 
 const int FORCE_BTN = 0; // GPIO0 / BOOT
 
@@ -26,16 +26,33 @@ enum DispState : uint8_t {
   DISP_CONECTADO
 };
 volatile DispState g_dispState = DISP_DESCONECTADO;
+volatile bool g_showProvisioningInfo = false;
 
 // Animación (puntos y fades)
 uint32_t lastAnimMs = 0;
-uint8_t dots = 0;
-bool pendingFadeToConnected = false;   // Transición B2 → Conectado tras GOT_IP
+volatile uint8_t dots = 0;
+volatile bool pendingFadeToConnected = false;   // Transición B2 → Conectado tras GOT_IP
 const uint16_t fadeMs = 120;           // Duración del fade (ms)
 
 // ===== Helpers OLED =====
 static void drawFrame() {
   u8g2.drawFrame(xOffset, yOffset, width, height);
+}
+
+static void drawProvisioningInstructions() {
+  const int16_t baseX = xOffset + 4;
+  const int16_t baseY = yOffset + 12;
+
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.setCursor(baseX, baseY);
+  u8g2.print("Configura con app");
+  u8g2.setCursor(baseX, baseY + 9);
+  u8g2.print("Servicio:");
+  u8g2.setCursor(baseX, baseY + 18);
+  u8g2.print(g_serviceName);
+  u8g2.setCursor(baseX, baseY + 27);
+  u8g2.print("PoP: ");
+  u8g2.print(POP);
 }
 
 static void drawCenteredText(const char* text) {
@@ -66,8 +83,12 @@ static void oledShow() {
       drawCenteredText("Desconectado");
       break;
     case DISP_SETUP:
-      snprintf(buf, sizeof(buf), "Setup%.*s", (dots % 3) + 1, "...");
-      drawCenteredText(buf);
+      if (g_showProvisioningInfo) {
+        drawProvisioningInstructions();
+      } else {
+        snprintf(buf, sizeof(buf), "Setup%.*s", (dots % 3) + 1, "...");
+        drawCenteredText(buf);
+      }
       break;
     case DISP_CONECTANDO:
       snprintf(buf, sizeof(buf), "Conectando%.*s", (dots % 3) + 1, "...");
@@ -87,6 +108,7 @@ void SysProvEvent(arduino_event_t *sys_event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       Serial.println("[WIFI] STA_CONNECTED");
       g_dispState = DISP_CONECTANDO;
+      g_showProvisioningInfo = false;
       break;
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -101,6 +123,7 @@ void SysProvEvent(arduino_event_t *sys_event) {
                     sys_event->event_info.wifi_sta_disconnected.reason);
       // SIN reconexiones automáticas: queda desconectado
       g_dispState = DISP_DESCONECTADO;
+      g_showProvisioningInfo = false;
       oledShow();
       break;
 
@@ -108,6 +131,7 @@ void SysProvEvent(arduino_event_t *sys_event) {
       Serial.println("[PROV] Provisioning iniciado (BLE)");
       g_dispState = DISP_SETUP;
       dots = 0;
+      g_showProvisioningInfo = true;
       oledShow();
       break;
 
@@ -119,6 +143,7 @@ void SysProvEvent(arduino_event_t *sys_event) {
       WiFi.mode(WIFI_MODE_STA);
       g_dispState = DISP_CONECTANDO;
       dots = 0;
+      g_showProvisioningInfo = false;
       oledShow();
       break;
 
@@ -127,6 +152,7 @@ void SysProvEvent(arduino_event_t *sys_event) {
                     sys_event->event_info.prov_fail_reason);
       g_dispState = DISP_SETUP;
       dots = 0;
+      g_showProvisioningInfo = true;
       oledShow();
       break;
 
@@ -134,6 +160,7 @@ void SysProvEvent(arduino_event_t *sys_event) {
       Serial.println("[PROV] Credenciales OK, conectando...");
       g_dispState = DISP_CONECTANDO;
       dots = 0;
+      g_showProvisioningInfo = false;
       oledShow();
       break;
 
@@ -143,13 +170,14 @@ void SysProvEvent(arduino_event_t *sys_event) {
   }
 }
 
-// ===== Iniciar BLE Provisioning con QR (Security 1) =====
+// ===== Iniciar BLE Provisioning con app (Security 1) =====
 static void startBleProvisioning() {
-  Serial.println("\n=== BLE Provisioning Security 1 + QR ===");
+  Serial.println("\n=== BLE Provisioning Security 1 (sin QR) ===");
 
   // Limpiar estados visuales y de transición
   pendingFadeToConnected = false;
   dots = 0;
+  g_showProvisioningInfo = true;
 
   // Importante: WiFi se mantiene OFF (WIFI_MODE_NULL) durante todo el provisioning
   // El handler WiFi.onEvent(...) está registrado SOLO en setup()
@@ -159,10 +187,12 @@ static void startBleProvisioning() {
       WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
       WIFI_PROV_SECURITY_1,
       POP,
-      SERVICE_NAME,
+      g_serviceName,
       SERVICE_KEY);
 
-  WiFiProv.printQR(SERVICE_NAME, POP, "ble");
+  Serial.println("Usa tu app para conectarte vía BLE:");
+  Serial.printf("  Servicio: %s\n", g_serviceName);
+  Serial.printf("  PoP: %s\n", POP);
 
   // Fade al entrar a Setup (tu elección)
   fadeTextAreaOnly(fadeMs);
@@ -170,9 +200,19 @@ static void startBleProvisioning() {
   oledShow();
 }
 
+static void buildServiceName() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(g_serviceName, sizeof(g_serviceName), "PROV_%02X%02X%02X", mac[3], mac[4], mac[5]);
+}
+
 void setup() {
   Serial.begin(9600);
   delay(200);
+
+  buildServiceName();
+  Serial.printf("Servicio BLE asignado: %s\n", g_serviceName);
+  Serial.printf("PoP configurado: %s\n", POP);
 
   // OLED
   u8g2.begin();
@@ -196,7 +236,11 @@ void setup() {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 5000) {
     g_dispState = DISP_CONECTANDO;
-    if (millis() - lastAnimMs > 350) { lastAnimMs = millis(); dots++; oledShow(); }
+    if (millis() - lastAnimMs > 350) {
+      lastAnimMs = millis();
+      dots++;
+      oledShow();
+    }
     delay(50);
   }
 
@@ -240,12 +284,14 @@ void loop() {
     pendingFadeToConnected = false;
     dots = 0;
 
-    // 4) Entrar a provisioning limpio (BLE + QR)
+    // 4) Entrar a provisioning limpio (BLE + app)
     startBleProvisioning();
   }
 
   // === Animación de texto y transición B2 con fade ===
-  if (g_dispState == DISP_SETUP || g_dispState == DISP_CONECTANDO) {
+  bool animateSetup = (g_dispState == DISP_SETUP) && !g_showProvisioningInfo;
+  bool animateConnecting = (g_dispState == DISP_CONECTANDO);
+  if (animateSetup || animateConnecting) {
     if (millis() - lastAnimMs > 350) {
       lastAnimMs = millis();
       dots++;
