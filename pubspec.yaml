@@ -17,6 +17,7 @@ dependencies:
   location: ^6.0.0
   logger: ^2.0.2
   wifi_scan: ^0.4.1+2
+  supabase_flutter: ^2.10.3
 
 dev_dependencies:
   flutter_test:
