@@ -193,51 +193,78 @@ class BleService {
           'La característica de provisión no permite escrituras desde la app.');
     }
 
-    final sanitizedSsid = ssid.trim();
-    final sanitizedPass = password.trim();
+    String _normalize(String value) => value.replaceAll('\n', '').trim();
 
-    // El firmware del ESP32 acepta SSID y contraseña separados por un salto de línea
-    // (y mantiene compatibilidad con el separador "|"). Preferimos enviar el
-    // formato nuevo para evitar problemas si la contraseña contiene dicho carácter.
-    final payload = utf8.encode('$sanitizedSsid\n$sanitizedPass\n');
-    FlutterBluePlusException? lastError;
-    for (var attempt = 0; attempt < 2; attempt++) {
-      characteristic = _requireProvisioningCharacteristic();
+    final normalizedSsid = _normalize(ssid);
+    final normalizedPass = _normalize(password);
 
-      final useWithoutResponse = !characteristic.properties.write &&
-          characteristic.properties.writeWithoutResponse;
+    // El firmware actualizado acepta "SSID\nPASS". Mantener un payload alternativo con
+    // el antiguo separador "|" nos permite retrocompatibilidad si el usuario no ha
+    // flasheado el sketch nuevo (o si el ESP32 todavía anuncia el modo antiguo).
+    final payloads = <({String label, List<int> bytes})>[
+      (
+        label: 'newline',
+        bytes: utf8.encode('$normalizedSsid\n$normalizedPass'),
+      ),
+      (
+        label: 'legacy',
+        bytes: utf8.encode('$normalizedSsid|$normalizedPass'),
+      ),
+    ];
 
-      try {
-        await characteristic.write(payload, withoutResponse: useWithoutResponse);
-        _log.i('Credenciales Wi-Fi enviadas al ESP32 (intento ${attempt + 1})');
-        return;
-      } on FlutterBluePlusException catch (e) {
-        lastError = e;
-        final errorText = e.toString().toUpperCase();
-        final isGatt133 =
-            errorText.contains('ANDROID-CODE: 133') || errorText.contains('GATT_ERROR');
+    FlutterBluePlusException? lastGattError;
 
-        if (!isGatt133 || attempt == 1) {
-          _log.e('Error al enviar credenciales al ESP32', error: e);
-          throw Exception(
-              'El dispositivo BLE rechazó las credenciales (${e.toString()}).');
-        }
+    for (final payload in payloads) {
+      for (var attempt = 0; attempt < 2; attempt++) {
+        characteristic = _requireProvisioningCharacteristic();
 
-        _log.w(
-            'Fallo GATT 133 al enviar credenciales. Reintentando tras reconectar...');
+        final useWithoutResponse = !characteristic.properties.write &&
+            characteristic.properties.writeWithoutResponse;
+
         try {
-          await _reconnectAndPrepare(device);
-        } catch (reconnectError) {
-          throw Exception(
-              'No se pudo recuperar la conexión BLE tras un error GATT: $reconnectError');
+          await characteristic.write(payload.bytes,
+              withoutResponse: useWithoutResponse);
+          _log.i(
+              'Credenciales Wi-Fi enviadas al ESP32 (formato ${payload.label}, intento ${attempt + 1}).');
+          return;
+        } on FlutterBluePlusException catch (e) {
+          lastGattError = e;
+          final errorText = e.toString().toUpperCase();
+          final isGatt133 = errorText.contains('ANDROID-CODE: 133') ||
+              errorText.contains('GATT_ERROR');
+
+          if (!isGatt133) {
+            _log.e('Error al enviar credenciales al ESP32', error: e);
+            throw Exception(
+                'El dispositivo BLE rechazó las credenciales (${e.toString()}).');
+          }
+
+          if (attempt == 0) {
+            _log.w(
+                'Fallo GATT 133 al enviar credenciales (formato ${payload.label}). Reintentando tras reconectar...');
+            try {
+              await _reconnectAndPrepare(device);
+              continue;
+            } catch (reconnectError) {
+              throw Exception(
+                  'No se pudo recuperar la conexión BLE tras un error GATT: $reconnectError');
+            }
+          }
+
+          // En la segunda caída GATT 133 cambiamos de formato para intentar la ruta legada.
+          _log.w(
+              'Persisten los errores GATT 133 al enviar credenciales (formato ${payload.label}). Intentando con un formato alternativo...');
+          break;
         }
       }
     }
 
-    if (lastError != null) {
+    if (lastGattError != null) {
       throw Exception(
-          'El dispositivo BLE rechazó las credenciales (${lastError.toString()}).');
+          'El dispositivo BLE rechazó las credenciales tras varios intentos (${lastGattError.toString()}).');
     }
+
+    throw Exception('No se pudieron enviar las credenciales al dispositivo BLE.');
   }
 
   /// Pide permisos necesarios. Devuelve true si todo OK.
