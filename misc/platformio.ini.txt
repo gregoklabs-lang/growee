@@ -12,7 +12,7 @@ board_build.partitions = huge_app.csv
 lib_deps =
     olikraus/U8g2 @ ^2.34.15
 
-; No necesitas lib_deps extra: WiFiProv viene en el core.
+; No necesitas lib_deps extra: WiFi y BLE vienen en el core de ESP32.
 ; Si quieres fijar el core (recomendado):
 ; platform_packages =
 ;   framework-arduinoespressif32 @ https://github.com/espressif/arduino-esp32.git#3.0.7
