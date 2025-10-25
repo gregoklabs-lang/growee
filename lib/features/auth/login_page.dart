@@ -11,14 +11,13 @@ class _LoginPageState extends State<LoginPage> {
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
-  final TextEditingController _confirmPasswordController =
-      TextEditingController();
+
+  bool _obscurePassword = true; // 👈 controla el ojito
 
   @override
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
-    _confirmPasswordController.dispose();
     super.dispose();
   }
 
@@ -77,7 +76,7 @@ class _LoginPageState extends State<LoginPage> {
                       borderRadius: BorderRadius.circular(24),
                       boxShadow: [
                         BoxShadow(
-                          color: Colors.blueGrey.withValues(alpha:0.15),
+                          color: Colors.blueGrey.withValues(alpha: 0.15),
                           blurRadius: 18,
                           offset: const Offset(0, 12),
                         ),
@@ -125,6 +124,7 @@ class _LoginPageState extends State<LoginPage> {
                           style: TextStyle(fontSize: 14, color: Colors.black54),
                         ),
                         const SizedBox(height: 28),
+
                         Form(
                           key: _formKey,
                           child: Column(
@@ -147,12 +147,28 @@ class _LoginPageState extends State<LoginPage> {
                                 },
                               ),
                               const SizedBox(height: 18),
+
+                              // ✅ Campo de contraseña con ojito
                               TextFormField(
                                 controller: _passwordController,
-                                obscureText: true,
+                                obscureText: _obscurePassword,
                                 decoration: _inputDecoration(
                                   'Contraseña*',
                                   'Introduce tu contraseña',
+                                ).copyWith(
+                                  suffixIcon: IconButton(
+                                    icon: Icon(
+                                      _obscurePassword
+                                          ? Icons.visibility_off
+                                          : Icons.visibility,
+                                      color: Colors.grey.shade700,
+                                    ),
+                                    onPressed: () {
+                                      setState(() {
+                                        _obscurePassword = !_obscurePassword;
+                                      });
+                                    },
+                                  ),
                                 ),
                                 validator: (value) {
                                   if (value == null || value.isEmpty) {
@@ -164,25 +180,9 @@ class _LoginPageState extends State<LoginPage> {
                                   return null;
                                 },
                               ),
-                              const SizedBox(height: 18),
-                              TextFormField(
-                                controller: _confirmPasswordController,
-                                obscureText: true,
-                                decoration: _inputDecoration(
-                                  'Confirmar contraseña*',
-                                  'Repite tu contraseña',
-                                ),
-                                validator: (value) {
-                                  if (value == null || value.isEmpty) {
-                                    return 'Confirma tu contraseña';
-                                  }
-                                  if (value != _passwordController.text) {
-                                    return 'Las contraseñas no coinciden';
-                                  }
-                                  return null;
-                                },
-                              ),
+
                               const SizedBox(height: 28),
+
                               SizedBox(
                                 width: double.infinity,
                                 child: ElevatedButton(
@@ -202,8 +202,10 @@ class _LoginPageState extends State<LoginPage> {
                                 ),
                               ),
                               const SizedBox(height: 16),
+
                               Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
                                 children: [
                                   TextButton(
                                     onPressed: () {},
